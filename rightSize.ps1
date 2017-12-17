@@ -1,111 +1,145 @@
-﻿<#
+﻿#Requires -Modules VMware.VimAutomation.Common
 
+<#
 .SYNOPSIS
-This script will right-size and enable hot-add for virtual machines that contain the specified vSphere tag parameters.
+This script will produce a CSV report of CPU/Memory recommendations from vROPs for vSphere VMs.
 
 .DESCRIPTION
-This script will do the following:
-- Get all VMs from vCenter(s) with the $vSphereTag_RightSizeBooleanName tag from the $vSphereTag_RightSizeBooleanCategoryName category
-- Get a list of all tag names (used for grouping) from tag category $vSphereTag_GroupingCategoryName
-- Based upon the VMs collected in the first query (those slated for right-sizing), categorise those VMs into groups based upon the second query (their associated group)
-- Determine the order in which the groups are to be processed
-- TODO: Keep populating
+The logic for right sizing is as follows:
+- Get current CPU/Memory allocations for a given VM
+- Get CPU/Memory recommendation values from vROPs (these are aggressive)
+- Determine how many % the current allocations for CPU/Memory deviate from the recommendation (regardless of undersized/oversized)
+- If CPU and/or Memory are >= $RIGHT_SIZE_TOLERANCE_PERCENTAGE, VM will be right-sized
+- Depending on whether CPU and/or Memory need to be resized, the following logic will determine what values to use:
+    - Difference Value = Recommendation - Current Allocation
+    - Recommended Value = Current Allocation + ($RIGHT_SIZE_BUFFER_PERCENTAGE * Difference Value)
+
+The percentage values for tolerance/buffer can be modified in the Constants section
+
+.PARAMETER vCenterServer
+FQDN of vCenter Server to query (NOTE: Script will also query all Linked vCenter Servers)
+
+.PARAMETER vCenterUsername
+Username in UPN format (user@domain) for above vCenterServer
+
+.PARAMETER vCenterPassword
+Password for vCenterUsername
+
+.PARAMETER allLinked
+Boolean flag of whether or not to connect to all vCenter Servers connected to the specified one above in ELM
+
+.PARAMETER vmFilter
+--OPTIONAL--
+Hashtable of VM filter values in the format @{Filter1 = Value1; Filter2 = Value2; Filter3 = "Value 3"}
+See example for some suggestions on usage. The filters are flags that you would normally call with Get-VM, ie -Name, -Id, etc.
+
+.PARAMETER vROPsServer
+fqdn of vROPs Server that is configured to monitor VMs within vCenterServer + Linked VCs
+
+.PARAMETER vROPsUsername
+Username in UPN format (user@domain) for above vROPsServer. It is recommended to use the 'admin' user.
+
+.PARAMETER vROPsPassword
+Password for vROPsUsername
+
+.PARAMETER CSVOutPath
+--OPTIONAL--
+Path to where the generated CSV file will be placed. If not specified, the csv file will be generated into the folder where the script resides.
 
 .EXAMPLE
-./rightSize.ps1 `
--vCenterServer "vmvimg01a.afp.le" `
--vCenterUsername "sampleuser" `
--vCenterPassword "samplepassword" `
--vSphereTag_RightSizeBooleanName "RightSize-Yes" `
--vSphereTag_RightSizeBooleanCategoryName "Right-Sizing" `
--vSphereTag_GroupingCategoryName "SCCM-Collections" `
--vROPsServer "vmonitoring.afp.le" `
--vROPsUsername "sampleuser" `
--vROPsPassword "samplepassword"
+.\rightSize-kc-readOnly.ps1 `
+-vCenterServer "vc-fqdn.local" `
+-vCenterUsername "foo@bar.com" `
+-vCenterPassword "p4ssw0rD1_" `
+-allLinked $true `
+-vmFilter @{Tag = "Tag Name"; Name = "*dev*"; Datastore = "DS Name"} `
+-vROPsServer "vrops-fqdn.local" `
+-vROPsUsername "admin" `
+-vROPsPassword "p4ssw0rD1_1234"
 
 .NOTES
-- Prerequisite that vSphere tags/categories are created/applied to VMs in order to be selected/grouped by this script
-
+- The operation to pull stats from vROPs can take a considerable amount of time
+- There is a REST API authentication issue present in vROPs 6.6.0, resolved in 6.6.1. Please avoid using 6.6.0 with this script
 #>
-
-
-#TODO: Add some error handling around not importing the module properly, as well as not having a new enough version of PowerCLI to use ops manager cmdlets
 
 #Define Params
 param
 (
-  [string]$vCenterServer,
-  [string]$vCenterUsername,
-  [string]$vCenterPassword,
-  [string]$vSphereTag_RightSizeBooleanName,
-  [string]$vSphereTag_RightSizeBooleanCategoryName,
-  [string]$vSphereTag_GroupingCategoryName,
-  [string]$vROPsServer,
-  [string]$vROPsUsername,
-  [string]$vROPsPassword
+  [string   ]$vCenterServer,
+  [string   ]$vCenterUsername,
+  [string   ]$vCenterPassword,
+  [boolean  ]$allLinked = $true,
+  [string   ]$vSphereTag_RightSizeBooleanName,
+  [string   ]$vSphereTag_RightSizeBooleanCategoryName,
+  [string   ]$vSphereTag_GroupingCategoryName,
+  [hashtable]$vmFilter = @{},
+  [string   ]$vROPsServer,
+  [string   ]$vROPsUsername,
+  [string   ]$vROPsPassword,
+  [string   ]$CSVOutPath = (Split-Path $script:MyInvocation.MyCommand.Path).toString()
 )
 
 #Define constants
-New-Variable -Name 'RIGHT_SIZE_TOLERANCE_PERCENTAGE' -Value 0.25 -Option Constant # 25%
-New-Variable -Name 'RIGHT_SIZE_BUFFER_PERCENTAGE' -Value 0.25 -Option Constant # aggressive recommendation from vROPs + 25%
-#New-Variable -Name 'T-SHIRT_SIZE_TOLERANCE_PERCENTAGE' -Value 0.15 -Option Constant # 15%
-New-Variable -Name 'NUM_MINUTES_TO_RUN_FOR' -Value 240 -Option Constant # 4 hours
-New-Variable -Name 'NUM_SECONDS_TO_WAIT_FOR_TOOLS_SHUTDOWN' -Value 120 -Option Constant # 2 minutes
-New-Variable -Name 'NUM_SECONDS_TO_WAIT_FOR_TOOLS_STARTUP' -Value 120 -Option Constant # 2 minutes
-New-Variable -Name 'MAX_RIGHT_SIZE_THREADS_ASYNC' -Value 10 -Option Constant # How many concurrent right sizing operations to run together
+New-Variable -Name 'MAX_RIGHT_SIZE_THREADS_ASYNC'           -Value  4    -Option Constant # How many concurrent right sizing operations to run together
+New-Variable -Name 'NUM_DAYS_BACK_VROPS'                    -Value -5    -Option Constant # Number of days to look back at data in vROPs
+New-Variable -Name 'NUM_MINUTES_TO_RUN_FOR'                 -Value  240  -Option Constant # 4 hours
+New-Variable -Name 'NUM_SECONDS_TO_WAIT_FOR_TOOLS_SHUTDOWN' -Value  120  -Option Constant # 2 minutes
+New-Variable -Name 'NUM_SECONDS_TO_WAIT_FOR_TOOLS_STARTUP'  -Value  120  -Option Constant # 2 minutes
+New-Variable -Name 'RIGHT_SIZE_BUFFER_PERCENTAGE'           -Value  0.15 -Option Constant # Aggressive recommendation from vROPs + RIGHT_SIZE_BUFFER_PERCENTAGE%
+New-Variable -Name 'RIGHT_SIZE_TOLERANCE_PERCENTAGE'        -Value  0.15 -Option Constant # How many % the VMs current values need to deviate away from the recommended value for in order to included in right sizing
 
 #Define variables
-$targetVMs = @{} #Empty dictionary
+$targetVMs   = @{} #Empty dictionary
 $excludedVMs = @{} #Empty dictionary
-$startTime = Get-Date 
-$cutOffTime = $startTime.AddMinutes($NUM_MINUTES_TO_RUN_FOR)
+$startTime   = Get-Date
+$cutOffTime  = $startTime.AddMinutes($NUM_MINUTES_TO_RUN_FOR)
 
-<#########################################
-#
-#SETUP CONNECTIONS
-#
-#########################################>
-
-#Import Module
-Import-Module VMware.PowerCLI
-
-#Configure PowerCLI for multiple servers in linked mode
-Set-PowerCLIConfiguration -DefaultVIServerMode Multiple -Scope User -Confirm:$false
-
+##########################################
+# SETUP CONNECTIONS
+##########################################
 #Create vCenter credentials
 $vCenterSecurePassword = ConvertTo-SecureString "$vCenterPassword" -AsPlainText -Force
-$vCenterCredential = New-Object System.Management.Automation.PSCredential ($vCenterUsername, $vCenterSecurePassword)
+$vCenterCredential     = New-Object System.Management.Automation.PSCredential ($vCenterUsername, $vCenterSecurePassword)
 
-#Create vROPs credentials
-$vROPsSecurePassword = ConvertTo-SecureString "$vROPsPassword" -AsPlainText -Force
-$vROPsCredential = New-Object System.Management.Automation.PSCredential ($vROPsUsername, $vROPsSecurePassword)
-
-#Make connection to vCenter
-Connect-VIServer -Server $vCenterServer -Credential $vCenterCredential -AllLinked
-
-#Make connection to vROPs (try/catch required because vROPs API is displaying flaky behavior)
-Try
+switch ($allLinked)
 {
-    Connect-OMServer -Server $vROPsServer -Credential $vROPsCredential -ErrorAction SilentlyContinue
-}
-Catch
-{
-    while ($global:DefaultOMServers.Count -le 0)
-    {
-        # Attempt to connect again
-        Connect-OMServer -Server $vROPsServer -Credential $vROPsCredential -ErrorAction SilentlyContinue
-
-        # Sleep 2 seconds then retry
-        sleep 2
+    $true  {
+        Set-PowerCLIConfiguration -DefaultVIServerMode Multiple -Scope User -Confirm:$false
+        $connectELM = @{AllLinked = $true}
+    }
+    $false {
+        Set-PowerCLIConfiguration -DefaultVIServerMode Single   -Scope User -Confirm:$false
+        $connectELM = @{}
     }
 }
 
-<#########################################
-#
-#PULL LIST OF VMS TO BE RIGHT SIZED
-#
-#########################################>
+#Create VC connection
+try {
+    $vCenterConnection = Connect-VIServer -Server $vCenterServer -Credential $vCenterCredential @connectELM
+}
+catch {
+    Write-Host "Error creating VC Connection!" -ForegroundColor Red
+    Write-Host $_.Exception.Message -ForegroundColor Red
+    exit -1
+}
 
+#Create vROPs credentials
+$vROPsSecurePassword   = ConvertTo-SecureString "$vROPsPassword" -AsPlainText -Force
+$vROPsCredential       = New-Object System.Management.Automation.PSCredential ($vROPsUsername, $vROPsSecurePassword)
+
+# Create vROPs Connection
+try {
+    Connect-OMServer -Server $vROPsServer -Credential $vROPsCredential | Out-Null
+}
+catch {
+    Write-Host "Error creating vROPs Connection!" -ForegroundColor Red
+    Write-Host $_.Exception.Message -ForegroundColor Red
+    exit -1
+}
+
+<#########################################
+# PULL LIST OF VMS TO BE RIGHT SIZED
+#########################################>
 # Get all VMs that are grouped as per the chosen resizing grouping method
 $vmGroupTagAssignment = Get-TagAssignment -Category (Get-TagCategory $vSphereTag_GroupingCategoryName)
 
@@ -120,8 +154,8 @@ $VMsToBeResized = Get-VM -Tag (Get-Tag -Name $vSphereTag_RightSizeBooleanName -C
 foreach ($groupName in $groupNames)
 {
     # Setup the hashtables for this group
-    $targetVMs.Add($groupName, @{})
-    $excludedVMs.Add($groupName, @{})
+    $targetVMs.Add($groupName, @())
+    $excludedVMs.Add($groupName, @())
 
     # Filter all VMs for the current group name
     $vmsInGroup = $vmGroupTagAssignment | Where-Object {$_.Tag.Name -eq $groupName} | select entity;
@@ -132,49 +166,25 @@ foreach ($groupName in $groupNames)
         # Check if the VM is to be resized
         if ($VMsToBeResized.Name -contains $vm)
         {
-            $targetVMs.$groupName.Add($vm, @{})
+            $targetVMs.$groupName += $vm
         }
         # If we get to here it's either because the VM is tagged with the $vSphereTag_RightSizeBooleanName tag or simply doesn't have a tag from $vSphereTag_RightSizeBooleanCategoryName
         else
         {
-            $excludedVMs.$groupName.Add($vm, @{})
+            $excludedVMs.$groupName += $vm
         }
     }
 }
 
-<#
-foreach ($key in $targetVMs.Keys)
-{
-    Write-Host $key
-    Write-Host $targetVMs.$key.Keys
-}
-exit 0
-#>
-
-<#
-EXAMPLE FROM ABOVE:
-RightSize3
-DVEVMOTMD000
-RightSize1
-DVEVMOTDR098
-RightSize2
-DVEVMOTDR097 DVEVMOTKC000
-#>
-
-
-<#########################################
-#
-#GATHER SOME STATS
-#
-#########################################>
-
-# Scriptblock to be run in async
+##########################################
+# SCRIPT BLOCK TO BE RUN IN ASYNC
+##########################################
 $aSyncResize = {
     Param
     (
         [string]$vmNameToResize
     )
-    
+
     # Define some temporary variables
     $vSphereVM = (Get-VM $vmNameToResize)
     [boolean]$CPUneedsResizing = $false
@@ -262,7 +272,7 @@ $aSyncResize = {
             - Finish and move onto next VM
             #>
 
-            # Do the resize work   
+            # Do the resize work
             # Gracefully shutdown VM if tools is running
             if (((($vSphereVM | Get-View).Guest.ToolsStatus) -eq "toolsOk") -or ((($vSphereVM | Get-View).Guest.ToolsStatus) -eq "toolsOld"))
             {
@@ -299,7 +309,7 @@ $aSyncResize = {
             if ($CPUneedsResizing)
             {
                 # Determine how many CPUs we want
-                # Get the recommendation from vROPs 
+                # Get the recommendation from vROPs
                 $recommendedCPU = $statsHashItem.Item("cpu|size.recommendation")
 
                 # Add the buffer overhead so that we aren't using the aggressive figure
@@ -323,7 +333,7 @@ $aSyncResize = {
             if ($MEMneedsResizing)
             {
                 # Determine how many MB of memory we want
-                # Get the recommendation from vROPs 
+                # Get the recommendation from vROPs
                 [decimal]$recommendedMem = $statsHashItem.Item("mem|size.recommendation")
 
                 # Add the buffer overhead so that we aren't using the aggressive figure
@@ -384,20 +394,20 @@ foreach ($groupName in $groupNames)
             Write-Host "NO TIME REMAINING, EXITING"
             exit -1
         }
-        
+
     }
 
     Write-Host $groupName - "Waiting.." -NoNewline
 
-    Do 
+    Do
     {
        Write-Host "." -NoNewline
        Start-Sleep -Seconds 1
-    } 
+    }
     While ( $jobs.Result.IsCompleted -contains $false)
-    
+
     Write-Host "All jobs completed!"
- 
+
     $results = @()
     ForEach ($job in $jobs)
     {
