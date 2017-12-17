@@ -199,9 +199,7 @@ $aSyncResize = {
     $vmToAnalyze = $vmToAnalyze.Value
 
     ##########################################
-    #
-    # GATHER SOME STAT#
-    #
+    # GATHER SOME STATS
     #########################################>
 
     # Define some temporary variables
