@@ -1,7 +1,6 @@
 ﻿#Requires -Modules VMware.VimAutomation.Common
 
 <#
-
 .SYNOPSIS
 This script will produce a CSV report of CPU/Memory recommendations from vROPs for vSphere VMs.
 
@@ -29,6 +28,11 @@ Password for vCenterUsername
 .PARAMETER allLinked
 Boolean flag of whether or not to connect to all vCenter Servers connected to the specified one above in ELM
 
+.PARAMETER vmFilter
+--OPTIONAL--
+Hashtable of VM filter values in the format @{Filter1 = Value1; Filter2 = Value2; Filter3 = "Value 3"}
+See example for some suggestions on usage. The filters are flags that you would normally call with Get-VM, ie -Name, -Id, etc.
+
 .PARAMETER vROPsServer
 fqdn of vROPs Server that is configured to monitor VMs within vCenterServer + Linked VCs
 
@@ -48,26 +52,28 @@ Path to where the generated CSV file will be placed. If not specified, the csv f
 -vCenterUsername "foo@bar.com" `
 -vCenterPassword "p4ssw0rD1_" `
 -allLinked $true `
+-vmFilter @{Tag = "Tag Name"; Name = "*dev*"; Datastore = "DS Name"} `
 -vROPsServer "vrops-fqdn.local" `
 -vROPsUsername "admin" `
 -vROPsPassword "p4ssw0rD1_1234"
 
 .NOTES
-The operation to pull stats from vROPs can take a considerable amount of time
-
+- The operation to pull stats from vROPs can take a considerable amount of time
+- There is a REST API authentication issue present in vROPs 6.6.0, resolved in 6.6.1. Please avoid using 6.6.0 with this script
 #>
 
 #Define Params
 param
 (
-  [string]$vCenterServer,
-  [string]$vCenterUsername,
-  [string]$vCenterPassword,
-  [boolean]$allLinked = $true,
-  [string]$vROPsServer,
-  [string]$vROPsUsername,
-  [string]$vROPsPassword,
-  [string]$CSVOutPath = (Split-Path $script:MyInvocation.MyCommand.Path).toString()
+  [string   ]$vCenterServer,
+  [string   ]$vCenterUsername,
+  [string   ]$vCenterPassword,
+  [boolean  ]$allLinked = $true,
+  [hashtable]$vmFilter = @{},
+  [string   ]$vROPsServer,
+  [string   ]$vROPsUsername,
+  [string   ]$vROPsPassword,
+  [string   ]$CSVOutPath = (Split-Path $script:MyInvocation.MyCommand.Path).toString()
 )
 
 <#
@@ -76,85 +82,100 @@ param
 ###############
 - Add error handling
     - VM doesn't exist in vROPs
-    - vROPs doesn't connect within x seconds or x attempts
-    - "" for vCenter
     - Can't write to CSV file
     - Write XLS (with colors, headers, totals, etc) instead of CSV
 #>
 
-<#########################################
-#
+##########################################
 # IMPORT MODULES
-#
-#########################################>
+##########################################
 Import-Module VMware.VimAutomation.Common
 
-<#########################################
-#
+##########################################
 # DEFINE CONSTANTS
-#
-#########################################>
+##########################################
 New-Variable -Name 'RIGHT_SIZE_TOLERANCE_PERCENTAGE' -Value   0.15 -Option Constant # How many % the VMs current values need to deviate away from the recommended value for in order to included in right sizing
 New-Variable -Name 'RIGHT_SIZE_BUFFER_PERCENTAGE'    -Value   0.15 -Option Constant # Aggressive recommendation from vROPs + RIGHT_SIZE_BUFFER_PERCENTAGE%
 New-Variable -Name 'MAX_RIGHT_SIZE_THREADS_ASYNC'    -Value   4    -Option Constant # How many concurrent right sizing operations to run together
 New-Variable -Name 'NUM_DAYS_BACK_VROPS'             -Value  -5    -Option Constant # Number of days to look back at data in vROPs
 
-<#########################################
-#
+##########################################
 # DEFINE/DECLARE VARS
-#
-#########################################>
+##########################################
 $startTime = Get-Date
 
 # Setup CSV Files
-$csvFile = $CSVOutPath + "\rightSizeReport-" + $startTime.toString("dd.MM.yyyy_hh.mm.ss.tt") + ".csv"
+$csvFile     = $CSVOutPath + "\rightSizeReport-" + $startTime.toString("dd.MM.yyyy_hh.mm.ss.tt") + ".csv"
 $csvContents = @()
 
-<#########################################
-#
+##########################################
 # SETUP CONNECTIONS
-#
-#########################################>
-#Clear all current connections
-Disconnect-VIServer * -Confirm:$false
-Disconnect-OMServer * -Confirm:$false
-
+##########################################
 #Create vCenter credentials
 $vCenterSecurePassword = ConvertTo-SecureString "$vCenterPassword" -AsPlainText -Force
 $vCenterCredential     = New-Object System.Management.Automation.PSCredential ($vCenterUsername, $vCenterSecurePassword)
 
-#If we want to connect to all ELM connected VCs
-if ($allLinked)
+switch ($allLinked)
 {
-    #Configure PowerCLI for multiple servers in linked mode
-    Set-PowerCLIConfiguration -DefaultVIServerMode Multiple -Scope User -Confirm:$false
-
-    #Create VC connection
-    $vCenterConnection = Connect-VIServer -Server $vCenterServer -Credential $vCenterCredential -AllLinked
-}
-#We dont' want to connect to all ELM connected VCs
-else
-{
-    #Configure PowerCLI for single server
-    Set-PowerCLIConfiguration -DefaultVIServerMode Single -Scope User -Confirm:$false
-
-    #Create VC connection
-    $vCenterConnection = Connect-VIServer -Server $vCenterServer -Credential $vCenterCredential
+    $true  {
+        Set-PowerCLIConfiguration -DefaultVIServerMode Multiple -Scope User -Confirm:$false
+        $connectELM = @{AllLinked = $true}
+    }
+    $false {
+        Set-PowerCLIConfiguration -DefaultVIServerMode Single   -Scope User -Confirm:$false
+        $connectELM = @{}
+    }
 }
 
-<#########################################
-#
+#Create VC connection
+try {
+    $vCenterConnection = Connect-VIServer -Server $vCenterServer -Credential $vCenterCredential @connectELM
+}
+catch {
+    Write-Host "Error creating VC Connection!" -ForegroundColor Red
+    Write-Host $_.Exception.Message -ForegroundColor Red
+    exit -1
+}
+
+#Create vROPs credentials
+$vROPsSecurePassword   = ConvertTo-SecureString "$vROPsPassword" -AsPlainText -Force
+$vROPsCredential       = New-Object System.Management.Automation.PSCredential ($vROPsUsername, $vROPsSecurePassword)
+
+# Create vROPs Connection
+try {
+    Connect-OMServer -Server $vROPsServer -Credential $vROPsCredential | Out-Null
+}
+catch {
+    Write-Host "Error creating vROPs Connection!" -ForegroundColor Red
+    Write-Host $_.Exception.Message -ForegroundColor Red
+    exit -1
+}
+
+##########################################
 # PULL LIST OF VMS TO BE RIGHT SIZED
-#
-#########################################>
+##########################################
 # Get all VMs
-$allVMs = Get-VM
+$allVMs = Get-VM @vmFilter
 
-<#########################################
-#
+##########################################
+# RETRIEVE VM STATISTICS
+##########################################
+Write-Host "Retrieving all VM stats from vROPs, this could take some time..." -ForegroundColor Magenta
+
+$allVMStats = $allVMs | `
+    Get-OMResource -ErrorAction SilentlyContinue -WarningAction SilentlyContinue | `
+    Get-OMStat -ErrorAction SilentlyContinue -WarningAction SilentlyContinue `
+    -IntervalType Days `
+    -IntervalCount 1 `
+    -RollupType Latest `
+    -From (Get-Date).AddDays($NUM_DAYS_BACK_VROPS) `
+    -Key (Get-OMStatKey "cpu|size.recommendation","mem|size.recommendation")
+
+Write-Host "VM stat retrieval complete" -ForegroundColor Magenta
+
+##########################################
 # SETUP ASYNC PREREQS
-#
-#########################################>
+##########################################
 
 # Setup runspace
 $runspacePool = [RunspaceFactory]::CreateRunspacePool(1, $MAX_RIGHT_SIZE_THREADS_ASYNC)
@@ -166,56 +187,29 @@ $powerShellInstance = @()
 
 $numOfVMs = $allVMs.Length
 
-<#########################################
-#
+##########################################
 # SCRIPT BLOCK TO BE RUN IN ASYNC
-#
-#########################################>
+##########################################
 
 # Scriptblock to be run in async
 $aSyncResize = {
     Param
     (
         $vmToAnalyze,
+        $recommendedCPU,
+        $recommendedMem,
         $csvContents,
-        $vROPsServer,
-        $vROPsUsername,
-        $vROPsPassword,
-        $NUM_DAYS_BACK_VROPS,
         $RIGHT_SIZE_TOLERANCE_PERCENTAGE,
         $RIGHT_SIZE_BUFFER_PERCENTAGE
     )
 
     $vmToAnalyze = $vmToAnalyze.Value
 
-    #Create vROPs credentials
-    $vROPsSecurePassword   = ConvertTo-SecureString "$vROPsPassword" -AsPlainText -Force
-    $vROPsCredential       = New-Object System.Management.Automation.PSCredential ($vROPsUsername, $vROPsSecurePassword)
-
-    #Make connection to vROPs (try/catch required because vROPs API is displaying flaky behavior)
-    do
-    {
-        # Attempt to connect again
-        Connect-OMServer -Server $vROPsServer -Credential $vROPsCredential | Out-Null
-
-        sleep 2
-    }
-    while ($global:DefaultOMServers.Count -le 0)
-
-    <#########################################
+    ##########################################
     #
-    # GATHER SOME STATS
+    # GATHER SOME STAT#
     #
     #########################################>
-    # Retrieve stats
-    $vmStats = $vmToAnalyze | `
-        Get-OMResource -ErrorAction SilentlyContinue -WarningAction SilentlyContinue | `
-        Get-OMStat -ErrorAction SilentlyContinue -WarningAction SilentlyContinue `
-        -IntervalType Days `
-        -IntervalCount 1 `
-        -RollupType Latest `
-        -From (Get-Date).AddDays($NUM_DAYS_BACK_VROPS) `
-        -Key (Get-OMStatKey "cpu|size.recommendation","mem|size.recommendation")
 
     # Define some temporary variables
     [boolean]$CPUneedsResizing = $false
@@ -228,20 +222,30 @@ $aSyncResize = {
     $row = New-Object System.Object
 
     $currentCPU      = [int]$vmToAnalyze.NumCpu
-    $recommendedCPU  = [int]($vmStats | ? {($_.Key -eq "cpu|size.recommendation") -and ($_.Resource.Name -eq $vmToAnalyze.Name)} | Sort-Object -Property Time -Descending | Select-Object Value -First 1).Value
     $currentMem      = [decimal]$vmToAnalyze.MemoryMB
-    $recommendedMem  = [decimal]($vmStats | ? {($_.Key -eq "cpu|mem.recommendation") -and ($_.Resource.Name -eq $vmToAnalyze.Name)} | Sort-Object -Property Time -Descending | Select-Object Value -First 1).Value
 
-    #Error handling in the event that vROPs has returned nothing for this VM, ie no data available
-    if ([int]$recommendedCPU -eq [int]0)
+    #Error handling in the event that vROPs has returned nothing for this VM, ie no data available. This may also be due to the VM being powered off
+    switch ($vmToAnalyze.Powerstate)
     {
-        $recommendedCPU = $currentCPU
-        $notes += "CPU recommendation was invalid. "
-    }
-    if ([decimal]$recommendedMem -eq [decimal]0)
-    {
-        $recommendedMem = $currentMem
-        $notes += "Memory recommendation was invalid. "
+        "PoweredOff"
+        {
+            $notes += "VM is powered off, no stats are available. Defaulting to current allocation. "
+            $recommendedCPU = $currentCPU
+            $recommendedMem = $currentMem
+        }
+        "PoweredOn"
+        {
+            if ([int]$recommendedCPU -eq [int]0)
+            {
+                $notes += "CPU recommendation was invalid. "
+                $recommendedCPU = $currentCPU
+            }
+            if ([decimal]$recommendedMem -eq [decimal]0)
+            {
+                $notes += "Memory recommendation was invalid. "
+                $recommendedMem = $currentMem
+            }
+        }
     }
 
     # Do some conditionals
@@ -336,11 +340,9 @@ $aSyncResize = {
     return $row
 }
 
-<#########################################
-#
+##########################################
 # QUEUE UP ASYNC JOBS
-#
-#########################################>
+##########################################
 
 # Add a job for every VM
 for ($i = 0; $i -lt $numOfVMs; $i++)
@@ -348,25 +350,24 @@ for ($i = 0; $i -lt $numOfVMs; $i++)
     $powerShellInstance += [powershell]::create()
     $powerShellInstance[$i].RunspacePool = $runspacePool
 
+    $recommendedCPU =      [int]($allVMStats | ? {($_.Key -eq "cpu|size.recommendation") -and ($_.Resource.Name -eq ($allVMs[$i]).Name)} | Sort-Object -Property Time -Descending | Select-Object Value -First 1).Value
+    $recommendedMem = [decimal](($allVMStats | ? {($_.Key -eq "mem|size.recommendation") -and ($_.Resource.Name -eq ($allVMs[$i]).Name)} | Sort-Object -Property Time -Descending | Select-Object Value -First 1).Value / 1KB)
+
     # Start a runspace job for this VM
     [void]$powerShellInstance[$i].AddScript($aSyncResize)
     $powerShellInstance[$i].AddArgument(([REF]$allVMs[$i]))
+    $powerShellInstance[$i].AddArgument($recommendedCPU)
+    $powerShellInstance[$i].AddArgument($recommendedMem)
     $powerShellInstance[$i].AddArgument(([REF]$csvContents))
-    $powerShellInstance[$i].AddArgument($vROPsServer)
-    $powerShellInstance[$i].AddArgument($vROPsUsername)
-    $powerShellInstance[$i].AddArgument($vROPsPassword)
-    $powerShellInstance[$i].AddArgument($NUM_DAYS_BACK_VROPS)
     $powerShellInstance[$i].AddArgument($RIGHT_SIZE_TOLERANCE_PERCENTAGE)
     $powerShellInstance[$i].AddArgument($RIGHT_SIZE_BUFFER_PERCENTAGE)
 
     $runspaceJobs += $powerShellInstance[$i].BeginInvoke()
 }
 
-<#########################################
-#
+##########################################
 # WAIT FOR JOBS TO FINISH
-#
-#########################################>
+##########################################
 
 # Wait for jobs to be finished, new jobs will be added when queue drains of runspace jobs
 for ($i = 0; $i -lt $allVMs.Length; $i++) {
@@ -393,13 +394,10 @@ for ($i = 0; $i -lt $allVMs.Length; $i++) {
     }
 }
 
-<#########################################
-#
+##########################################
 # WRITE TO CSV
-#
-#########################################>
-
+##########################################
 # Write the CSV file out
 $csvContents | Export-CSV -NoTypeInformation -Path $csvFile
 
-Write-Host "Output File: "$csvFile
+Write-Host "Output File: " -NoNewLine -ForegroundColor Magenta; Write-Host $csvFile -ForegroundColor Green
