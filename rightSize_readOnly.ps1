@@ -89,10 +89,10 @@ param
 ##########################################
 # DEFINE CONSTANTS
 ##########################################
-New-Variable -Name 'RIGHT_SIZE_TOLERANCE_PERCENTAGE' -Value   0.15 -Option Constant # How many % the VMs current values need to deviate away from the recommended value for in order to included in right sizing
-New-Variable -Name 'RIGHT_SIZE_BUFFER_PERCENTAGE'    -Value   0.15 -Option Constant # Aggressive recommendation from vROPs + RIGHT_SIZE_BUFFER_PERCENTAGE%
 New-Variable -Name 'MAX_RIGHT_SIZE_THREADS_ASYNC'    -Value   4    -Option Constant # How many concurrent right sizing operations to run together
 New-Variable -Name 'NUM_DAYS_BACK_VROPS'             -Value  -5    -Option Constant # Number of days to look back at data in vROPs
+New-Variable -Name 'RIGHT_SIZE_BUFFER_PERCENTAGE'    -Value   0.15 -Option Constant # Aggressive recommendation from vROPs + RIGHT_SIZE_BUFFER_PERCENTAGE%
+New-Variable -Name 'RIGHT_SIZE_TOLERANCE_PERCENTAGE' -Value   0.15 -Option Constant # How many % the VMs current values need to deviate away from the recommended value for in order to included in right sizing
 
 ##########################################
 # DEFINE/DECLARE VARS
@@ -185,8 +185,6 @@ $numOfVMs = $allVMs.Length
 ##########################################
 # SCRIPT BLOCK TO BE RUN IN ASYNC
 ##########################################
-
-# Scriptblock to be run in async
 $aSyncResize = {
     Param
     (
