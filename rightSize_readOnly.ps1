@@ -87,11 +87,6 @@ param
 #>
 
 ##########################################
-# IMPORT MODULES
-##########################################
-Import-Module VMware.VimAutomation.Common
-
-##########################################
 # DEFINE CONSTANTS
 ##########################################
 New-Variable -Name 'RIGHT_SIZE_TOLERANCE_PERCENTAGE' -Value   0.15 -Option Constant # How many % the VMs current values need to deviate away from the recommended value for in order to included in right sizing
