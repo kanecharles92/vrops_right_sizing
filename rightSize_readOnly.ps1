@@ -196,6 +196,35 @@ $aSyncResize = {
         $RIGHT_SIZE_BUFFER_PERCENTAGE
     )
 
+    ##########################################
+    # DECLARE FUNCTIONS
+    ##########################################
+
+    # Function to take the recommended memory value and scale it up to the nearest multiple of 4
+    Function MemoryRoundUp
+    {
+        param
+        (
+            [int]$recommendedMemory
+        )
+
+        # Check to see if the current value can be cleanly divided by 4
+        if (($recommendedMemory % 4) -ne 0)
+        {
+            for ($i = 1; $i -le 3; $i++)
+            {
+                if ((($recommendedMemory + $i) % 4) -eq 0)
+                {
+                    return [int]($recommendedMemory + $i)
+                }
+            }
+        }
+        else
+        {
+            return [int]$recommendedMemory
+        }
+    }
+
     $vmToAnalyze = $vmToAnalyze.Value
 
     ##########################################
@@ -305,6 +334,9 @@ $aSyncResize = {
                 # Ensure we convert the recommendedMem to an integer, ie nearest whole megabyte
                 $recommendedMem = [int]$recommendedMem
 
+                # Round up to the nearest increment of 4
+                $recommendedMem = MemoryRoundUp($recommendedMem)
+
                 # If the VM has been powered off/vROPs recommendation is 0, don't change the recommended value. ie don't modify CPU
                 if ($recommendedMem -eq 0)
                 {
@@ -392,3 +424,5 @@ for ($i = 0; $i -lt $allVMs.Length; $i++) {
 $csvContents | Export-CSV -NoTypeInformation -Path $csvFile
 
 Write-Host "Output File: " -NoNewLine -ForegroundColor Magenta; Write-Host $csvFile -ForegroundColor Green
+
+$csvContents | Out-GridView
