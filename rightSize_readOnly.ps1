@@ -89,7 +89,7 @@ param
 ##########################################
 # DEFINE CONSTANTS
 ##########################################
-New-Variable -Name 'MAX_RIGHT_SIZE_THREADS_ASYNC'    -Value   4    -Option Constant # How many concurrent right sizing operations to run together
+New-Variable -Name 'MAX_RIGHT_SIZE_THREADS_ASYNC'    -Value   50   -Option Constant # How many concurrent right sizing operations to run together
 New-Variable -Name 'NUM_DAYS_BACK_VROPS'             -Value  -5    -Option Constant # Number of days to look back at data in vROPs
 New-Variable -Name 'RIGHT_SIZE_BUFFER_PERCENTAGE'    -Value   0.15 -Option Constant # Aggressive recommendation from vROPs + RIGHT_SIZE_BUFFER_PERCENTAGE%
 New-Variable -Name 'RIGHT_SIZE_TOLERANCE_PERCENTAGE' -Value   0.15 -Option Constant # How many % the VMs current values need to deviate away from the recommended value for in order to included in right sizing
@@ -124,7 +124,7 @@ switch ($allLinked)
 
 #Create VC connection
 try {
-    $vCenterConnection = Connect-VIServer -Server $vCenterServer -Credential $vCenterCredential @connectELM
+    Connect-VIServer -Server $vCenterServer -Credential $vCenterCredential @connectELM
 }
 catch {
     Write-Host "Error creating VC Connection!" -ForegroundColor Red
@@ -138,7 +138,7 @@ $vROPsCredential       = New-Object System.Management.Automation.PSCredential ($
 
 # Create vROPs Connection
 try {
-    Connect-OMServer -Server $vROPsServer -Credential $vROPsCredential | Out-Null
+    Connect-OMServer -Server $vROPsServer -Credential $vROPsCredential
 }
 catch {
     Write-Host "Error creating vROPs Connection!" -ForegroundColor Red
@@ -209,42 +209,42 @@ $aSyncResize = {
         )
 
         # Check to see if the current value can be cleanly divided by 4
-        if (($recommendedMemory % 4) -ne 0)
+        if (($recommendedMemory % 4) -eq 0)
         {
-            for ($i = 1; $i -le 3; $i++)
-            {
-                if ((($recommendedMemory + $i) % 4) -eq 0)
-                {
+            return [int]$recommendedMemory
+        }
+        else
+        {
+            # Otherwise we need to iterate through until we hit an integer multiple of 4
+            for ($i = 1; $i -le 3; $i++) {
+                if ((($recommendedMemory + $i) % 4) -eq 0) {
                     return [int]($recommendedMemory + $i)
                 }
             }
         }
-        else
-        {
-            return [int]$recommendedMemory
-        }
     }
-
-    $vmToAnalyze = $vmToAnalyze.Value
 
     ##########################################
     # GATHER SOME STATS
     #########################################>
+    # Grab value of VM based on memory pointer passed in
+    $vmToAnalyze = $vmToAnalyze.Value
 
     # Define some temporary variables
     [boolean]$CPUneedsResizing = $false
     [boolean]$MEMneedsResizing = $false
     [boolean]$isUndersized     = $false
     [boolean]$isOversized      = $false
-    [string]$notes = ""
+    [string] $notes = ""
 
-    # # Prepare CSV Row
+    # Grab current allocation
+    $currentCPU =     [int]$vmToAnalyze.NumCpu
+    $currentMem = [decimal]$vmToAnalyze.MemoryMB
+
+    # Prepare blank CSV Row
     $row = New-Object System.Object
 
-    $currentCPU      = [int]$vmToAnalyze.NumCpu
-    $currentMem      = [decimal]$vmToAnalyze.MemoryMB
-
-    #Error handling in the event that vROPs has returned nothing for this VM, ie no data available. This may also be due to the VM being powered off
+    # Error handling in the event that vROPs has returned nothing for this VM, ie no data available. This may also be due to the VM being powered off
     switch ($vmToAnalyze.Powerstate)
     {
         "PoweredOff"
@@ -290,11 +290,7 @@ $aSyncResize = {
         $cpuDifferencePercentage = $cpuDifferenceValue / $currentCPU
         $memDifferencePercentage = $memDifferenceValue / $currentMem
 
-        # Convert percentages to positive numbers if they are negative (ie oversized)
-        if ($cpuDifferencePercentage -lt 0) { $cpuDifferencePercentage = $cpuDifferencePercentage * -1}
-        if ($memDifferencePercentage -lt 0) { $memDifferencePercentage = $memDifferencePercentage * -1}
-
-        # Determine if our difference values are outside of the tolerances defined in the constants at the top of the script
+        # Determine if our difference values are greater than the tolerances defined in the constants at the top of the script
         if ($cpuDifferencePercentage -gt $RIGHT_SIZE_TOLERANCE_PERCENTAGE) { $CPUneedsResizing = $true }
         if ($memDifferencePercentage -gt $RIGHT_SIZE_TOLERANCE_PERCENTAGE) { $MEMneedsResizing = $true }
 
@@ -304,15 +300,16 @@ $aSyncResize = {
             # Apply CPU modification is necessary
             if ($CPUneedsResizing)
             {
-                # Add the buffer overhead so that we aren't using the aggressive figure
-                # Force to be an integer so that the extra % doesn't give us a decimal
-                [decimal]$recommendedCPU = ($recommendedCPU + ($RIGHT_SIZE_BUFFER_PERCENTAGE * $cpuDifferenceValue))
+                # Determine the vCPU allocation
+                # If oversized, add the buffer overhead so that we aren't using the aggressive figure
+                # If undersized, go with aggressive figure so that we aren't adding extra resources that aren't necessary
+                if ($isOversized) { [decimal]$recommendedCPU = ($recommendedCPU + ($RIGHT_SIZE_BUFFER_PERCENTAGE * $cpuDifferenceValue)) }
 
                 # Convert to int, ie round up/down to nearest whole number
                 $recommendedCPU = [int]$recommendedCPU
 
                 # Check to see if the recommendedCPU is an odd number, if it is we will be adding 1 so that we are always using even CPU figures
-                if (![bool]!($recommendedCPU%2))
+                if ([bool]($recommendedCPU%2))
                 {
                     $recommendedCPU += 1
                 }
@@ -327,9 +324,10 @@ $aSyncResize = {
             # Apply Memory modification is necessary
             if ($MEMneedsResizing)
             {
-                # Determine how many MB of memory we want
-                # Add the buffer overhead so that we aren't using the aggressive figure
-                [decimal]$recommendedMem = ($recommendedMem + ($RIGHT_SIZE_BUFFER_PERCENTAGE * $memDifferenceValue))
+                # Determine the vMem allocation in megabytes
+                # If oversized, add the buffer overhead so that we aren't using the aggressive figure
+                # If undersized, go with aggressive figure so that we aren't adding extra resources that aren't necessary
+                if ($isOversized) { [decimal]$recommendedMem = ($recommendedMem + ($RIGHT_SIZE_BUFFER_PERCENTAGE * $memDifferenceValue)) }
 
                 # Ensure we convert the recommendedMem to an integer, ie nearest whole megabyte
                 $recommendedMem = [int]$recommendedMem
@@ -373,8 +371,8 @@ for ($i = 0; $i -lt $numOfVMs; $i++)
     $powerShellInstance += [powershell]::create()
     $powerShellInstance[$i].RunspacePool = $runspacePool
 
-    $recommendedCPU =      [int]($allVMStats | ? {($_.Key -eq "cpu|size.recommendation") -and ($_.Resource.Name -eq ($allVMs[$i]).Name)} | Sort-Object -Property Time -Descending | Select-Object Value -First 1).Value
-    $recommendedMem = [decimal](($allVMStats | ? {($_.Key -eq "mem|size.recommendation") -and ($_.Resource.Name -eq ($allVMs[$i]).Name)} | Sort-Object -Property Time -Descending | Select-Object Value -First 1).Value / 1KB)
+    $recommendedCPU = [int]     ($allVMStats | Where-Object {($_.Key -eq "cpu|size.recommendation") -and ($_.Resource.Name -eq ($allVMs[$i]).Name)} | Sort-Object -Property Time -Descending | Select-Object Value -First 1).Value
+    $recommendedMem = [decimal](($allVMStats | Where-Object {($_.Key -eq "mem|size.recommendation") -and ($_.Resource.Name -eq ($allVMs[$i]).Name)} | Sort-Object -Property Time -Descending | Select-Object Value -First 1).Value / 1KB)
 
     # Start a runspace job for this VM
     [void]$powerShellInstance[$i].AddScript($aSyncResize)
