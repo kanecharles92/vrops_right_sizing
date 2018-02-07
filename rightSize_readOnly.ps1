@@ -235,7 +235,7 @@ $aSyncResize = {
     [boolean]$MEMneedsResizing = $false
     [boolean]$isUndersized     = $false
     [boolean]$isOversized      = $false
-    [string] $notes = ""
+    [string] $notes            = ""
 
     # Grab current allocation
     $currentCPU =     [int]$vmToAnalyze.NumCpu
@@ -257,12 +257,12 @@ $aSyncResize = {
         {
             if ([int]$recommendedCPU -eq [int]0)
             {
-                $notes += "CPU recommendation was invalid. "
+                $notes += "CPU recommendation was invalid. Defaulting to current allocation. "
                 $recommendedCPU = $currentCPU
             }
             if ([decimal]$recommendedMem -eq [decimal]0)
             {
-                $notes += "Memory recommendation was invalid. "
+                $notes += "Memory recommendation was invalid. Defaulting to current allocation. "
                 $recommendedMem = $currentMem
             }
         }
@@ -303,7 +303,7 @@ $aSyncResize = {
                 # Determine the vCPU allocation
                 # If oversized, add the buffer overhead so that we aren't using the aggressive figure
                 # If undersized, go with aggressive figure so that we aren't adding extra resources that aren't necessary
-                if ($isOversized) { [decimal]$recommendedCPU = ($recommendedCPU + ($RIGHT_SIZE_BUFFER_PERCENTAGE * $cpuDifferenceValue)) }
+                if ($currentCPU -gt $recommendedCPU) { [decimal]$recommendedCPU = ($recommendedCPU + ($RIGHT_SIZE_BUFFER_PERCENTAGE * $cpuDifferenceValue)) }
 
                 # Convert to int, ie round up/down to nearest whole number
                 $recommendedCPU = [int]$recommendedCPU
@@ -313,12 +313,6 @@ $aSyncResize = {
                 {
                     $recommendedCPU += 1
                 }
-
-                # If the VM has been powered off/vROPs recommendation is 0, don't change the recommended value. ie don't modify CPU
-                if ($recommendedCPU -eq 0)
-                {
-                    $recommendedCPU = $currentCPU
-                }
             }
 
             # Apply Memory modification is necessary
@@ -327,19 +321,13 @@ $aSyncResize = {
                 # Determine the vMem allocation in megabytes
                 # If oversized, add the buffer overhead so that we aren't using the aggressive figure
                 # If undersized, go with aggressive figure so that we aren't adding extra resources that aren't necessary
-                if ($isOversized) { [decimal]$recommendedMem = ($recommendedMem + ($RIGHT_SIZE_BUFFER_PERCENTAGE * $memDifferenceValue)) }
+                if ($currentMem -gt $recommendedMem) { [decimal]$recommendedMem = ($recommendedMem + ($RIGHT_SIZE_BUFFER_PERCENTAGE * $memDifferenceValue)) }
 
                 # Ensure we convert the recommendedMem to an integer, ie nearest whole megabyte
                 $recommendedMem = [int]$recommendedMem
 
                 # Round up to the nearest increment of 4
                 $recommendedMem = MemoryRoundUp($recommendedMem)
-
-                # If the VM has been powered off/vROPs recommendation is 0, don't change the recommended value. ie don't modify CPU
-                if ($recommendedMem -eq 0)
-                {
-                    $recommendedMem = $currentMem
-                }
             }
         }
     }
